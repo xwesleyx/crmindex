@@ -1,0 +1,1098 @@
+// Fase 1: fundação (User, Role, Activity, Notification, Auth.js).
+// Fase 2: núcleo do CRM (Lead, Contact, Company, Opportunity, KanbanStage, Task).
+// Fase 5: operação (Customer, Sale, Installation, InstallationChecklistItem).
+// Fase 6: Central de Atendimento (Conversation, Message).
+// Demais entidades (Proposal, Ticket, Product, Service, Plan, Payment,
+// Contract) chegam nas próximas fases — ver README.md.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  ADMIN
+  GERENTE
+  VENDEDOR
+  ATENDIMENTO
+  INSTALADOR
+  FINANCEIRO
+}
+
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+}
+
+model User {
+  id                String     @id @default(cuid())
+  name              String
+  email             String     @unique
+  emailVerified     DateTime?
+  image             String?
+  passwordHash      String?
+  role              UserRole   @default(VENDEDOR)
+  status            UserStatus @default(ACTIVE)
+  // WhatsApp do próprio atendente/vendedor — usado pelo lembrete automático
+  // de tarefa/agenda (seção "mensagem automática... faltando 30 minutos
+  // antes"), nunca exibido pro cliente. Sem isso preenchido, o lembrete
+  // simplesmente não é enviado pra essa pessoa (não é obrigatório).
+  phone             String?
+  // Visão da Agenda que abre por padrão pra esta pessoa (estrela nas abas:
+  // "lista" | "grade" | "semana" | "calendario"). null = Lista.
+  agendaDefaultView String?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  accounts      Account[]
+  sessions      Session[]
+  activities    Activity[]
+  notifications Notification[]
+
+  leadsResponsible           Lead[]                      @relation("LeadResponsible")
+  opportunitiesOwned         Opportunity[]               @relation("OpportunityOwner")
+  tasksAssigned              Task[]                      @relation("TaskAssignee")
+  contactsResponsible        Contact[]                   @relation("ContactResponsible")
+  companiesResponsible       Company[]                   @relation("CompanyResponsible")
+  customersResponsible       Customer[]                  @relation("CustomerResponsible")
+  customerCultureEdits       Customer[]                  @relation("CustomerCultureEditor")
+  salesOwned                 Sale[]                      @relation("SaleOwner")
+  installationsResponsible   Installation[]              @relation("InstallationResponsible")
+  checklistItemsCompleted    InstallationChecklistItem[] @relation("ChecklistItemCompletedBy")
+  conversationsAssigned      Conversation[]              @relation("ConversationAssignee")
+  messagesSent               Message[]                   @relation("MessageSender")
+  conversationParticipations ConversationParticipant[]
+
+  prospeccaoDraft ProspeccaoDraft?
+
+  permissionOverride UserPermissionOverride?
+
+  @@index([role])
+  @@map("users")
+}
+
+// Aditivo sobre o perfil fixo (UserRole) — nunca substitui. Uma linha por
+// usuário (não uma linha por permissão) porque é editado inteiro de uma vez
+// só, num formulário único em Configurações > Permissões. modulesGranted/
+// modulesRevoked guardam ModuleKey (telas/menus); capabilities guarda um mapa
+// CapabilityKey -> boolean (ações específicas, ex: "kanban.edit"). Convenção
+// de JSON-como-TEXT igual a Company.socios/Activity.metadata — sem chave
+// presente = "herda do perfil", nunca um terceiro estado a mais pra checar.
+model UserPermissionOverride {
+  id             String   @id @default(cuid())
+  userId         String   @unique
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  modulesGranted String   @default("[]")
+  modulesRevoked String   @default("[]")
+  capabilities   String   @default("{}")
+  updatedAt      DateTime @updatedAt
+  updatedBy      String?
+  createdAt      DateTime @default(now())
+
+  @@map("user_permission_overrides")
+}
+
+// Modelos abaixo são exigidos pelo adapter do Auth.js (@auth/prisma-adapter).
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("sessions")
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+  @@map("verification_tokens")
+}
+
+// Auditoria (seção 19/24 do escopo): login, logout, criação, alteração,
+// exclusão e mudanças de permissão. Expandida nas próximas fases para cobrir
+// oportunidades, vendas, instalações etc.
+model Activity {
+  id         String   @id @default(cuid())
+  userId     String?
+  action     String
+  entityType String
+  entityId   String?
+  metadata   String?
+  createdAt  DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([entityType, entityId])
+  @@index([userId])
+  @@index([createdAt])
+  @@map("activities")
+}
+
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  title     String
+  message   String
+  link      String?
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+  @@map("notifications")
+}
+
+// ---------------------------------------------------------------------------
+// Fase 2 — núcleo do CRM
+// ---------------------------------------------------------------------------
+
+enum Priority {
+  BAIXA
+  NORMAL
+  ALTA
+  URGENTE
+}
+
+// Compartilhado por Lead e Opportunity (seção 5/14 do escopo da Fase 2).
+enum LeadOrigin {
+  WHATSAPP
+  INDICACAO
+  INSTAGRAM
+  FACEBOOK
+  SITE
+  GOOGLE
+  TELEFONE
+  EVENTO
+  PROSPECCAO
+  OUTRO
+}
+
+// Tipo de vínculo entre um Contact e a empresa a que pertence (seção 3 do
+// adendo de Atendimento) — classificação estruturada, separada do campo
+// livre `role` (cargo).
+enum ContactLinkType {
+  FUNCIONARIO
+  GERENTE
+  DIRETOR
+  SOCIO
+  RESPONSAVEL
+  FINANCEIRO
+  TECNICO
+  OUTRO
+}
+
+enum LeadStatus {
+  NOVO
+  CONTATO_REALIZADO
+  EM_ATENDIMENTO
+  QUALIFICADO
+  NAO_QUALIFICADO
+  CONVERTIDO
+  PERDIDO
+}
+
+enum OpportunityStatus {
+  OPEN
+  WON
+  LOST
+}
+
+enum LossReason {
+  PRECO
+  CONCORRENTE
+  SEM_INTERESSE
+  SEM_ORCAMENTO
+  PRAZO
+  OUTRO
+}
+
+// Temperatura calculada (não escolhida à mão) de Lead/Oportunidade — ver
+// src/features/temperature/engine.ts. null = não se aplica (registro
+// terminal: Ganha/Perdida, Convertido/Não Qualificado/Perdido).
+enum Temperature {
+  QUENTE
+  MORNO
+  FRIO
+}
+
+enum KanbanBoard {
+  COMMERCIAL
+  INSTALLATION
+}
+
+enum TaskStatus {
+  PENDENTE
+  EM_ANDAMENTO
+  CONCLUIDA
+}
+
+model Lead {
+  id       String  @id @default(cuid())
+  name     String
+  phone    String
+  whatsapp String?
+  email    String?
+
+  // Dados informais de empresa antes da conversão — viram (ou casam com) um
+  // Company de verdade só no momento da conversão (seção 8/9). Exceção: leads
+  // vindos da Prospecção CNPJ já nascem com a Company de verdade criada (tem
+  // dados completos da Receita disponíveis na hora), apontada por
+  // sourceCompanyId — nada a ver com convertedCompanyId, que só é setado na
+  // conversão em Oportunidade (o lead pode nunca converter e ainda assim já
+  // ter uma Company vinculada).
+  companyName     String?
+  companyCnpj     String?
+  sourceCompanyId String?
+  sourceCompany   Company? @relation("LeadSourceCompany", fields: [sourceCompanyId], references: [id], onDelete: SetNull)
+
+  origin   LeadOrigin
+  status   LeadStatus @default(NOVO)
+  priority Priority   @default(NORMAL)
+  notes    String?
+
+  lastInteractionAt DateTime?
+  nextActionAt      DateTime?
+  nextActionNote    String?
+
+  // Sinalizadores de 1 clique (features/temperature) — cada um só guarda a
+  // última vez que aconteceu; clicar de novo atualiza a data, clicar quando
+  // já ativo desliga (seta null). Alimentam o cálculo de temperatura.
+  signalPedeProposta    DateTime?
+  signalPerguntouPreco  DateTime?
+  signalPedeDemo        DateTime?
+  signalInformouPrazo   DateTime?
+  signalProblemaUrgente DateTime?
+
+  temperature          Temperature?
+  temperatureScore     Int?
+  temperatureUpdatedAt DateTime?
+  temperatureOverride  Boolean      @default(false)
+
+  responsibleId String?
+  responsible   User?   @relation("LeadResponsible", fields: [responsibleId], references: [id], onDelete: SetNull)
+
+  // Preenchidos na conversão (seção 8). Não são @unique: a deduplicação pode
+  // reaproveitar um Contact/Company já usado por outro Lead antes (seção 9).
+  convertedContactId String?
+  convertedCompanyId String?
+  convertedAt        DateTime?
+
+  convertedContact Contact? @relation("LeadConvertedContact", fields: [convertedContactId], references: [id], onDelete: SetNull)
+  convertedCompany Company? @relation("LeadConvertedCompany", fields: [convertedCompanyId], references: [id], onDelete: SetNull)
+
+  // A Opportunity é quem guarda a FK (sourceLeadId, @unique — um lead só
+  // origina uma oportunidade); aqui é só o lado inverso da relação.
+  opportunity Opportunity? @relation("OpportunitySourceLead")
+
+  conversations Conversation[]
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@index([status])
+  @@index([responsibleId])
+  @@index([phone])
+  @@index([email])
+  @@map("leads")
+}
+
+model Contact {
+  id       String  @id @default(cuid())
+  name     String
+  // Nullable: seção 3 da Etapa 3 exige aceitar contato com só WhatsApp.
+  phone    String?
+  whatsapp String?
+  email    String?
+  role     String? // cargo
+  notes    String?
+  isActive Boolean @default(true)
+
+  // Último nome de perfil do WhatsApp ("push name") recebido deste contato.
+  // Enquanto `name` for igual a ele (ou ao telefone), o nome acompanha o
+  // WhatsApp; se alguém renomear no CRM, o nome escolhido fica e dá pra
+  // voltar ao do WhatsApp a qualquer momento (renameContact/
+  // resetContactNameToWhatsapp).
+  whatsappName String?
+
+  // Vínculo pessoa↔empresa (seção 1-3 do adendo de Atendimento): department é
+  // livre, linkType é a classificação estruturada, isPrimaryContact marca o
+  // contato principal daquela empresa. "Só um principal por empresa" é
+  // regra de aplicação (feita na action, dentro de uma transação), não
+  // constraint de banco — SQLite/Prisma não tem índice único parcial direto.
+  department       String?
+  linkType         ContactLinkType?
+  isPrimaryContact Boolean          @default(false)
+
+  // false só para o "contato-sombra" criado automaticamente quando uma
+  // mensagem chega de um número desconhecido ou ambíguo (seção 4-6 do
+  // adendo) — sinaliza que a identidade ainda não foi confirmada por um
+  // atendente. Default true: contatos já existentes/criados normalmente
+  // sempre são "identificados".
+  identified Boolean @default(true)
+
+  // Reaproveita o enum já criado para Lead/Opportunity (seção 5 da Etapa 3:
+  // "evitar duplicação desnecessária de enums") — opcional aqui porque nem
+  // todo contato tem origem conhecida (ex: cadastrado junto da empresa).
+  origin LeadOrigin?
+
+  lastInteractionAt DateTime?
+
+  companyId String?
+  company   Company? @relation(fields: [companyId], references: [id], onDelete: SetNull)
+
+  responsibleId String?
+  responsible   User?   @relation("ContactResponsible", fields: [responsibleId], references: [id], onDelete: SetNull)
+
+  opportunities    Opportunity[]
+  leadsConvertedTo Lead[]        @relation("LeadConvertedContact")
+
+  // 1:1 opcional — nem todo Contact é cliente (seção 3/6 da Etapa 5).
+  customer      Customer?
+  sales         Sale[]
+  installations Installation[]
+
+  // Um contato pode ter várias conversas ao longo do tempo (seção 4/5 da
+  // Fase 6) — é ele quem identifica "quem está falando" desde a 1ª mensagem,
+  // mesmo antes de existir Lead/Customer.
+  conversations Conversation[]
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@index([companyId])
+  @@index([responsibleId])
+  @@index([phone])
+  @@index([email])
+  @@map("contacts")
+}
+
+model Company {
+  id        String  @id @default(cuid())
+  legalName String // razão social
+  tradeName String? // nome fantasia
+  cnpj      String? @unique // armazenado só com dígitos (normalizado)
+  phone     String?
+  whatsapp  String?
+  email     String?
+  website   String?
+
+  addressLine   String? // logradouro
+  addressNumber String?
+  complement    String?
+  neighborhood  String?
+  city          String?
+  state         String?
+  zipCode       String?
+
+  notes    String?
+  isActive Boolean @default(true)
+
+  origin LeadOrigin?
+
+  // Dados públicos da Receita Federal (via BrasilAPI, features/prospeccao ou
+  // o botão "Buscar dados completos") — preenchidos automaticamente, sem UI
+  // de edição própria. cnaesSecundarios/socios ficam como JSON em texto
+  // (mesma convenção de Activity.metadata, sem usar o tipo Json do Prisma).
+  cnae               String? // código da atividade econômica principal
+  cnaeDescricao      String?
+  cnaesSecundarios   String? // JSON: [{ codigo, descricao }]
+  naturezaJuridica   String?
+  porte              String?
+  foundedAt          DateTime? // data de abertura na Receita
+  // BigInt, não Int: capital social de empresas grandes de verdade passa de
+  // R$ 21 milhões (2,1 bi de centavos) — já estourou o Int32 num teste com a
+  // Vale S.A. (R$ 77,8 bi).
+  capitalSocialCents BigInt? // capital social declarado, em centavos
+  taxStatus          String? // situação cadastral na Receita (ex: "ATIVA")
+  taxStatusDate      DateTime? // data da situação cadastral atual
+  socios             String? // JSON: [{ nome, qualificacao, dataEntrada }]
+  optanteSimples     Boolean? // null = nunca consultado, diferente de "não optante"
+  optanteMei         Boolean?
+  receitaEnrichedAt  DateTime? // última vez que os dados acima foram atualizados
+
+  responsibleId String?
+  responsible   User?   @relation("CompanyResponsible", fields: [responsibleId], references: [id], onDelete: SetNull)
+
+  // Região geográfica/comercial (seção "Regiões" — filtro de Kanban/
+  // Dashboard/Relatórios) — opcional, definida manualmente pelo usuário.
+  regionId String?
+  region   Region? @relation("CompanyRegion", fields: [regionId], references: [id], onDelete: SetNull)
+
+  contacts         Contact[]
+  opportunities    Opportunity[]
+  leadsConvertedTo Lead[]        @relation("LeadConvertedCompany")
+  leadsSourcedFrom Lead[]        @relation("LeadSourceCompany")
+
+  // 1:1 opcional — uma Company pode existir no CRM sem nunca ter comprado
+  // (seção 3 da Etapa 5). Customer é o relacionamento comercial ativo,
+  // não uma cópia da Company.
+  customer      Customer?
+  sales         Sale[]
+  installations Installation[]
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@index([cnpj])
+  @@index([responsibleId])
+  @@map("companies")
+}
+
+// Região geográfica/comercial definida livremente pelo usuário em
+// Configurações (nome + cor) — vinculada a Company e Customer, usada pra
+// filtrar Kanban/Dashboard/Relatórios por um ou vários locais de uma vez
+// (seção "Regiões" do pedido). `color` é hex livre (ex: "#3b82f6"), aplicado
+// via style inline nas telas — não vira classe Tailwind porque o valor é
+// escolhido em runtime pelo usuário (o JIT do Tailwind v4 só gera CSS pra
+// classe literal no código-fonte).
+model Region {
+  id    String @id @default(cuid())
+  name  String
+  color String
+
+  // Região usada automaticamente quando uma Empresa/Cliente é criado sem
+  // escolher uma região (seção "qualquer empresa, cliente... virá nessa
+  // padrão") — só uma pode ser default por vez; trocar a default é feito
+  // dentro de uma transação em regions/actions.ts (mesmo princípio de
+  // "só um X por vez" já usado em Contact.isPrimaryContact).
+  isDefault Boolean @default(false)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  companies Company[]  @relation("CompanyRegion")
+  customers Customer[] @relation("CustomerRegion")
+
+  @@unique([name])
+  @@map("regions")
+}
+
+model KanbanStage {
+  id     String      @id @default(cuid())
+  name   String
+  key    String
+  order  Int
+  board  KanbanBoard @default(COMMERCIAL)
+  active Boolean     @default(true)
+  color  String      @default("#64748b") // hex — editável em Configurações > Kanbans
+
+  opportunities Opportunity[]
+  installations Installation[]
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@unique([board, key])
+  @@index([board, order])
+  @@map("kanban_stages")
+}
+
+model Opportunity {
+  id          String  @id @default(cuid())
+  title       String
+  description String?
+  notes       String?
+
+  // Dinheiro em centavos (Int) — SQLite não suporta Decimal no Prisma;
+  // evita imprecisão de ponto flutuante (seção 14 do escopo).
+  estimatedValueCents Int @default(0)
+
+  // Valor recorrente estimado (MRR) — opcional, separado do valor de
+  // implantação/pontual acima. Carregado pra Sale.recurringAmountCents
+  // quando a venda é ganha (mesmo espírito de estimatedValueCents →
+  // Sale.amountCents).
+  recurringValueCents Int @default(0)
+
+  priority Priority          @default(NORMAL)
+  origin   LeadOrigin
+  status   OpportunityStatus @default(OPEN)
+
+  // Posição manual dentro da própria faixa de prioridade na coluna do Kanban
+  // — mesmo campo/motivo de Installation.kanbanOrder (ver comentário lá).
+  kanbanOrder Float @default(0)
+
+  expectedCloseAt   DateTime?
+  lastInteractionAt DateTime?
+
+  wonAt DateTime?
+
+  lostReason LossReason?
+  lostNote   String?
+  lostAt     DateTime?
+
+  // Sinalizadores de 1 clique (features/temperature) — ver mesmos campos em
+  // Lead, comentário lá tem o detalhe do comportamento de toggle.
+  signalPedeProposta    DateTime?
+  signalPerguntouPreco  DateTime?
+  signalPedeDemo        DateTime?
+  signalInformouPrazo   DateTime?
+  signalProblemaUrgente DateTime?
+
+  temperature          Temperature?
+  temperatureScore     Int?
+  temperatureUpdatedAt DateTime?
+  temperatureOverride  Boolean      @default(false)
+
+  contactId String?
+  contact   Contact? @relation(fields: [contactId], references: [id], onDelete: SetNull)
+
+  companyId String?
+  company   Company? @relation(fields: [companyId], references: [id], onDelete: SetNull)
+
+  ownerId String?
+  owner   User?   @relation("OpportunityOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+
+  stageId String
+  stage   KanbanStage @relation(fields: [stageId], references: [id], onDelete: Restrict)
+
+  // Etapa anterior + quando entrou na etapa atual — usado para "tempo na
+  // etapa" no card (seção 18) sem precisar agregar o histórico toda hora.
+  stageEnteredAt DateTime @default(now())
+
+  sourceLeadId String? @unique
+  sourceLead   Lead?   @relation("OpportunitySourceLead", fields: [sourceLeadId], references: [id], onDelete: SetNull)
+
+  // 1:1 — uma oportunidade ganha origina no máximo uma venda (seção 11 da
+  // Etapa 5); a constraint @unique em Sale.opportunityId garante isso e
+  // torna a automação idempotente no nível do banco, não só na aplicação.
+  sale          Sale?
+  installations Installation[]
+
+  conversations Conversation[]
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@index([stageId])
+  @@index([ownerId])
+  @@index([status])
+  @@index([companyId])
+  @@index([contactId])
+  @@map("opportunities")
+}
+
+// Mesmo padrão do Activity (entityType/entityId) — já fica pronto para
+// Ticket/Installation nas próximas fases sem alterar o schema de novo.
+model Task {
+  id              String     @id @default(cuid())
+  title           String
+  description     String?
+  dueAt           DateTime?
+  // Quanto tempo o compromisso ocupa a partir de dueAt (Grade/Semana mostram
+  // início–fim; aviso de conflito usa isso). null = sem duração definida.
+  durationMinutes Int?
+  // Repetição: ao concluir, cria a próxima ocorrência sozinha.
+  // "DAILY" | "WEEKLY" | "BIWEEKLY" | "MONTHLY" — null = não repete.
+  recurrence      String?
+  priority        Priority   @default(NORMAL)
+  status          TaskStatus @default(PENDENTE)
+
+  entityType String
+  entityId   String
+
+  assigneeId String?
+  assignee   User?   @relation("TaskAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  completedAt DateTime?
+
+  reminders TaskReminder[]
+
+  @@index([entityType, entityId])
+  @@index([assigneeId, status])
+  @@index([dueAt])
+  @@map("tasks")
+}
+
+// Um ou mais alertas por tarefa (padrão: 30min antes, seção "posso definir
+// mais alertas ou o tempo") — o agendador (instrumentation.ts) varre as
+// linhas com sentAt nulo e cujo horário de disparo (dueAt - minutesBefore)
+// já chegou, manda a mensagem pro WhatsApp do responsável, e marca sentAt.
+// sentAt também é a trava de idempotência: nunca reenvia a mesma linha.
+model TaskReminder {
+  id            String    @id @default(cuid())
+  taskId        String
+  task          Task      @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  minutesBefore Int
+  sentAt        DateTime?
+  createdAt     DateTime  @default(now())
+
+  @@index([taskId])
+  @@index([sentAt])
+  @@map("task_reminders")
+}
+
+// ---------------------------------------------------------------------------
+// Fase 5 — Venda, Cliente, Instalação
+// ---------------------------------------------------------------------------
+
+enum CustomerStatus {
+  ATIVO
+  INATIVO
+}
+
+enum SaleStatus {
+  CONFIRMADA
+  CANCELADA
+}
+
+enum PaymentMethod {
+  PIX
+  BOLETO
+  CARTAO_CREDITO
+  CARTAO_DEBITO
+  TRANSFERENCIA
+  DINHEIRO
+  OUTRO
+}
+
+enum InstallationStatus {
+  EM_ANDAMENTO
+  CONCLUIDA
+  CANCELADA
+}
+
+// Relacionamento comercial ativo — NÃO é cópia de Company/Contact (seção 3).
+// companyId e contactId são @unique: no máximo um Customer por Company e no
+// máximo um por Contact, o que torna a automação de Venda Ganha idempotente
+// já no nível do banco (seção 7/13).
+model Customer {
+  id     String         @id @default(cuid())
+  status CustomerStatus @default(ATIVO)
+
+  companyId String?  @unique
+  company   Company? @relation(fields: [companyId], references: [id], onDelete: SetNull)
+
+  contactId String?  @unique
+  contact   Contact? @relation(fields: [contactId], references: [id], onDelete: SetNull)
+
+  responsibleId String?
+  responsible   User?   @relation("CustomerResponsible", fields: [responsibleId], references: [id], onDelete: SetNull)
+
+  // Região própria do cliente (pode divergir da região da Empresa/Contato
+  // vinculado — ex: cliente com filiais em outra região) — opcional, mesmo
+  // conceito de Company.regionId. A resolução de "região efetiva" (usada
+  // nos filtros de Kanban/Dashboard/Relatórios) cai pra region da Company/
+  // Contact quando este campo não é definido — ver
+  // src/features/regions/query-helpers.ts.
+  regionId String?
+  region   Region? @relation("CustomerRegion", fields: [regionId], references: [id], onDelete: SetNull)
+
+  becameCustomerAt DateTime @default(now())
+  notes            String?
+
+  // Aba "Cultura/Modelo" da ficha: como esse cliente funciona (ex.: "não
+  // criar funcionário", "usa VPN própria"). cultureContent é HTML gerado
+  // pelo editor (Tiptap) e só é exibido pelo próprio editor em modo leitura
+  // — nunca via innerHTML. cultureAlert é o aviso curto que aparece em
+  // destaque no Atendimento.
+  cultureContent     String?
+  cultureAlert       String?
+  cultureUpdatedAt   DateTime?
+  cultureUpdatedById String?
+  cultureUpdatedBy   User?     @relation("CustomerCultureEditor", fields: [cultureUpdatedById], references: [id], onDelete: SetNull)
+
+  sales         Sale[]
+  installations Installation[]
+  conversations Conversation[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([responsibleId])
+  @@map("customers")
+}
+
+// opportunityId é @unique: uma oportunidade ganha origina no máximo uma
+// venda — é a constraint que garante a idempotência da automação (seção 11).
+model Sale {
+  id     String     @id @default(cuid())
+  status SaleStatus @default(CONFIRMADA)
+
+  opportunityId String      @unique
+  opportunity   Opportunity @relation(fields: [opportunityId], references: [id], onDelete: Restrict)
+
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+
+  // Obtidos por referência da Opportunity no momento da venda, não copiados
+  // como valores independentes (seção 8: "não copiar os dados das
+  // entidades") — continuam sendo o mesmo Company/Contact, só evitam join
+  // duplo (Sale → Opportunity → Company) nas listagens/filtros.
+  companyId String?
+  company   Company? @relation(fields: [companyId], references: [id], onDelete: SetNull)
+
+  contactId String?
+  contact   Contact? @relation(fields: [contactId], references: [id], onDelete: SetNull)
+
+  ownerId String?
+  owner   User?   @relation("SaleOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+
+  // Centavos (Int) — mesmo padrão de Opportunity.estimatedValueCents.
+  // amountCents já é o valor líquido (pós-desconto) cobrado na venda;
+  // discountCents é só o registro de quanto foi abatido, pra exibição —
+  // não recalcula amountCents automaticamente.
+  amountCents          Int
+  discountCents        Int            @default(0)
+  recurringAmountCents Int            @default(0)
+  paymentMethod        PaymentMethod?
+
+  soldAt DateTime @default(now())
+  notes  String?
+
+  installation Installation?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([customerId])
+  @@index([ownerId])
+  @@index([status])
+  @@map("sales")
+}
+
+// saleId é @unique: uma venda origina no máximo uma instalação (mesmo
+// princípio de idempotência do Sale/Opportunity).
+model Installation {
+  id     String             @id @default(cuid())
+  status InstallationStatus @default(EM_ANDAMENTO)
+
+  saleId String @unique
+  sale   Sale   @relation(fields: [saleId], references: [id], onDelete: Restrict)
+
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+
+  companyId String?
+  company   Company? @relation(fields: [companyId], references: [id], onDelete: SetNull)
+
+  contactId String?
+  contact   Contact? @relation(fields: [contactId], references: [id], onDelete: SetNull)
+
+  // Rastreabilidade até a oportunidade de origem (seção 15).
+  opportunityId String?
+  opportunity   Opportunity? @relation(fields: [opportunityId], references: [id], onDelete: SetNull)
+
+  responsibleId String?
+  responsible   User?   @relation("InstallationResponsible", fields: [responsibleId], references: [id], onDelete: SetNull)
+
+  priority Priority @default(NORMAL)
+
+  // Posição manual dentro da própria faixa de prioridade na coluna do Kanban
+  // (drag-and-drop livre — seção "posicionar em qualquer lugar, respeitando
+  // a prioridade"). Float pra inserir entre dois cards vizinhos calculando a
+  // média (ex: 1.5 entre 1 e 2) sem precisar renumerar o resto da coluna a
+  // cada arraste. Prioridade continua sendo o critério de ordenação
+  // principal (sortByPriorityThen) — isto é só o desempate dentro da mesma
+  // prioridade, nunca muda a prioridade em si.
+  kanbanOrder Float @default(0)
+
+  stageId String
+  stage   KanbanStage @relation(fields: [stageId], references: [id], onDelete: Restrict)
+
+  stageEnteredAt DateTime @default(now())
+
+  scheduledAt DateTime?
+  startedAt   DateTime?
+  completedAt DateTime?
+  dueAt       DateTime?
+
+  notes String?
+
+  checklistItems InstallationChecklistItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([customerId])
+  @@index([stageId])
+  @@index([responsibleId])
+  @@index([status])
+  @@map("installations")
+}
+
+model InstallationChecklistItem {
+  id    String @id @default(cuid())
+  label String
+  order Int
+
+  required  Boolean @default(true)
+  completed Boolean @default(false)
+
+  completedAt DateTime?
+
+  completedById String?
+  completedBy   User?   @relation("ChecklistItemCompletedBy", fields: [completedById], references: [id], onDelete: SetNull)
+
+  installationId String
+  installation   Installation @relation(fields: [installationId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([installationId, order])
+  @@map("installation_checklist_items")
+}
+
+// Template editável em Configurações > Checklist de Instalação — cada item
+// aqui é copiado (não referenciado) pra InstallationChecklistItem na criação
+// de uma instalação nova (ver runOpportunityWonAutomation), então mudar o
+// template não afeta instalações já existentes.
+model ChecklistTemplateItem {
+  id    String @id @default(cuid())
+  label String
+  order Int
+
+  required Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([order])
+  @@map("checklist_template_items")
+}
+
+// ---------------------------------------------------------------------------
+// Fase 6 — Central de Atendimento (Conversation, Message)
+// ---------------------------------------------------------------------------
+
+enum ConversationStatus {
+  OPEN
+  WAITING_CUSTOMER
+  WAITING_INTERNAL
+  RESOLVED
+  CLOSED
+}
+
+// Fila/departamento (seção 16/21 do escopo) — nullable de propósito: esta
+// etapa não implementa gestão de fila completa, só deixa o campo pronto pra
+// uso futuro sem precisar de nova migration.
+enum ConversationQueue {
+  COMERCIAL
+  SUPORTE
+  FINANCEIRO
+  IMPLANTACAO
+}
+
+enum MessageDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum MessageType {
+  TEXT
+  IMAGE
+  VIDEO
+  AUDIO
+  DOCUMENT
+  STICKER
+  LOCATION
+  SYSTEM
+}
+
+enum MessageStatus {
+  PENDING
+  SENT
+  DELIVERED
+  READ
+  FAILED
+}
+
+// Um atendimento (seção 4). Reaproveita Contact/Lead/Opportunity/Customer já
+// existentes — só o vínculo com Contact é obrigatório: é ele quem identifica
+// "quem está falando" desde a 1ª mensagem, antes mesmo de virar Lead (seção
+// 5). channel/channelIdentifier/provider preparam multi-número e múltiplos
+// providers (seção 20/21) sem prender o modelo a um WhatsApp fixo.
+model Conversation {
+  id       String             @id @default(cuid())
+  status   ConversationStatus @default(OPEN)
+  priority Priority           @default(NORMAL)
+  queue    ConversationQueue?
+
+  channel           String  @default("whatsapp")
+  channelIdentifier String?
+  provider          String  @default("manual")
+
+  contactId String
+  contact   Contact @relation(fields: [contactId], references: [id], onDelete: Restrict)
+
+  leadId String?
+  lead   Lead?   @relation(fields: [leadId], references: [id], onDelete: SetNull)
+
+  opportunityId String?
+  opportunity   Opportunity? @relation(fields: [opportunityId], references: [id], onDelete: SetNull)
+
+  customerId String?
+  customer   Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  assigneeId String?
+  assignee   User?   @relation("ConversationAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+
+  // Contador simples (seção 18) — zerado ao abrir a conversa
+  // (markConversationRead), incrementado a cada mensagem inbound recebida.
+  unreadCount        Int      @default(0)
+  lastMessageAt      DateTime @default(now())
+  lastMessagePreview String?
+
+  closedAt  DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  // Última vez que a mensagem automática de "fora do horário de
+  // atendimento" foi mandada nesta conversa — manda no máximo uma vez por
+  // dia (compara a data, não o horário exato), pra não repetir a cada
+  // mensagem que o cliente mandar durante a mesma noite/madrugada.
+  lastAfterHoursNoticeAt DateTime?
+
+  messages Message[]
+
+  // Atendentes extras ("Participar"): além do responsável (assignee), podem
+  // responder ao cliente e ver as notas internas desta conversa.
+  participants ConversationParticipant[]
+
+  @@index([status])
+  @@index([assigneeId])
+  @@index([contactId])
+  @@index([lastMessageAt])
+  @@map("conversations")
+}
+
+// providerMessageId é @unique (nullable): identifica a mensagem no provider
+// externo (seção 6/20) — evita duplicar mensagem se um webhook futuro
+// reenviar o mesmo evento.
+model Message {
+  id             String       @id @default(cuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  direction      MessageDirection
+  type           MessageType      @default(TEXT)
+  content        String
+  status         MessageStatus    @default(SENT)
+  mediaUrl       String?
+  // Arquivo apagado em Configurações > Limpeza (manual ou programada): a
+  // mensagem fica, o balão avisa que a mídia foi removida.
+  mediaDeletedAt DateTime?
+
+  // "Responder" (seção do chat): aponta pra mensagem citada, só dentro da
+  // mesma conversa — é um recurso do CRM (não replica o quote nativo do
+  // WhatsApp, que exigiria montar o protobuf ContextInfo/QuotedMessage).
+  replyToId String?
+  replyTo   Message?  @relation("MessageReplyTo", fields: [replyToId], references: [id], onDelete: SetNull)
+  replies   Message[] @relation("MessageReplyTo")
+
+  provider          String  @default("manual")
+  providerMessageId String? @unique
+
+  senderUserId String?
+  senderUser   User?   @relation("MessageSender", fields: [senderUserId], references: [id], onDelete: SetNull)
+
+  // Nota interna ("modo anônimo" do chat): fica só no CRM, nunca vai pro
+  // WhatsApp do cliente — visível pra quem atende a conversa.
+  internal Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@index([conversationId, createdAt])
+  @@map("messages")
+}
+
+// Chave-valor genérico pra segredos/config configuráveis pela UI (em vez de
+// só .env) — hoje só guarda CFO_API_KEY (Configurações > Integrações), mas
+// serve pra qualquer config futura sem precisar de migration nova. Valor
+// gravado em texto puro (mesmo nível de confiança do .env — CRM
+// self-hosted, sem multi-tenant).
+model AppSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+  updatedBy String?
+
+  @@map("app_settings")
+}
+
+// Mensagens rápidas do Atendimento (Configurações > Respostas rápidas) —
+// digitar "/" + o atalho no campo de mensagem abre a lista pra escolher; ao
+// selecionar, o texto completo entra no campo (o atendente ainda aperta
+// Enter pra mandar). shortcut é único e guardado sem a barra ("p", não
+// "/p") — a barra é só a tecla de gatilho na UI.
+model QuickReply {
+  id        String   @id @default(cuid())
+  shortcut  String   @unique
+  message   String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("quick_replies")
+}
+
+// Rascunho da última busca da Prospecção CNPJ (filtros + resultados, ainda
+// não importados como Lead) — salvo por usuário, não por navegador, pra
+// acessar do celular e ver a mesma busca que fez no computador (pedido
+// explícito: "aparecer para todo mundo, inclusive no celular"). Substituiu
+// o localStorage, que não sincroniza entre aparelhos. filters/results ficam
+// como JSON em texto (mesma convenção de Activity.metadata).
+model ProspeccaoDraft {
+  userId    String   @id
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  filters   String // JSON: ProspeccaoFilters
+  results   String // JSON: ProspectResult[]
+  updatedAt DateTime @updatedAt
+
+  @@map("prospeccao_drafts")
+}
+
+// Atendente extra numa conversa (botão "Participar" / "Adicionar atendente").
+// O responsável continua em Conversation.assigneeId; aqui ficam os demais.
+model ConversationParticipant {
+  id             String       @id @default(cuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt      DateTime     @default(now())
+
+  @@unique([conversationId, userId])
+  @@index([userId])
+  @@map("conversation_participants")
+}
